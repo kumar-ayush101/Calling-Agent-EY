@@ -1,21 +1,24 @@
 import os
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # <--- ADD THIS IMPORT
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
-from dotenv import load_dotenv  # Import this
+from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
 
+# --- ENABLE CORS FOR ALL ROUTES ---
+CORS(app)  # <--- THIS LINE ENABLES UNIVERSAL ACCESS
+
 # --- CONFIGURATION ---
-# Now we read from the secure .env file instead of hardcoding
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 
-# Check if keys loaded correctly (Optional safety check)
+# Check if keys loaded correctly
 if not TWILIO_AUTH_TOKEN:
     raise ValueError("No Twilio Auth Token found. Make sure .env file exists.")
 
@@ -34,8 +37,6 @@ def make_call():
         call = client.calls.create(
             to=user_number,
             from_=TWILIO_PHONE_NUMBER,
-            # We explicitly tell Twilio to use POST to avoid confusion, 
-            # but our routes below now support GET too just in case.
             url=f"{server_url}voice-logic",
             method='POST',
             status_callback=f"{server_url}call-status",
@@ -56,22 +57,19 @@ def make_call():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# FIX: Allow GET and POST so Twilio doesn't get a 405 Error
-# --- REPLACE THESE TWO FUNCTIONS IN YOUR APP.PY ---
-
 @app.route('/voice-logic', methods=['GET', 'POST'])
 def voice_logic():
     """Instructions for the call"""
     server_url = request.host_url
     resp = VoiceResponse()
     
-    # 1. Use Indian English voice so the user subconsciously matches the accent
+    # 1. Speak instructions
     resp.say("Hello. Please say your full name clearly after the beep.", voice='alice', language='en-IN')
     
-    # 2. Use <Gather> instead of <Record>
-    # input='speech': We want speech-to-text
-    # language='en-IN': Optimized for Indian accents
-    # speechTimeout='auto': Detects when they stop speaking automatically
+    # 2. Play Beep
+    resp.play('https://api.twilio.com/cowbell.mp3') 
+
+    # 3. Gather Speech
     gather = resp.gather(
         input='speech', 
         language='en-IN', 
@@ -80,20 +78,15 @@ def voice_logic():
         method='POST'
     )
     
-    # If they stay silent for 5 seconds, this runs:
     resp.say("We did not hear anything. Goodbye.", voice='alice', language='en-IN')
-    
     return str(resp)
 
 @app.route('/handle-recording', methods=['GET', 'POST'])
 def handle_recording():
     """Called immediately after they stop speaking"""
-    
-    # <Gather> sends the text in 'SpeechResult'
-    # It also sends a recording URL if we asked for it, but here we prioritize text
     call_sid = request.values.get('CallSid')
-    speech_text = request.values.get('SpeechResult') # <--- THIS IS THE TEXT
-    confidence = request.values.get('Confidence')    # How sure is the AI? (0.0 to 1.0)
+    speech_text = request.values.get('SpeechResult') 
+    confidence = request.values.get('Confidence') 
 
     print(f"DEBUG: Speech received: {speech_text} (Confidence: {confidence})")
     
@@ -105,7 +98,6 @@ def handle_recording():
             call_data_store[call_sid]['transcription'] = "(No speech detected)"
         
     resp = VoiceResponse()
-    # Confirm what we heard to the user (Optional but cool for demos)
     if speech_text:
         resp.say(f"Thank you, {speech_text}. We have recorded your response.", voice='alice', language='en-IN')
     else:
@@ -113,11 +105,8 @@ def handle_recording():
         
     return str(resp)
 
-
-# FIX: Allow GET and POST
 @app.route('/handle-transcription', methods=['GET', 'POST'])
 def handle_transcription():
-    """Called by Twilio when text is ready"""
     call_sid = request.values.get('CallSid')
     transcription_text = request.values.get('TranscriptionText')
     
@@ -128,14 +117,12 @@ def handle_transcription():
         
     return "OK", 200
 
-# Optional: Handle status updates to avoid 404 errors in logs
 @app.route('/call-status', methods=['GET', 'POST'])
 def call_status():
     return "OK", 200
 
 @app.route('/get-response/<call_sid>', methods=['GET'])
 def get_response(call_sid):
-    """Frontend polls this to get the final text"""
     result = call_data_store.get(call_sid)
     if result:
         return jsonify(result)
