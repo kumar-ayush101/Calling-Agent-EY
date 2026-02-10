@@ -1,31 +1,28 @@
 import os
+import threading  # <--- NEW IMPORT
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # <--- ADD THIS IMPORT
+from flask_cors import CORS
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
-
-# --- ENABLE CORS FOR ALL ROUTES ---
-CORS(app)  # <--- THIS LINE ENABLES UNIVERSAL ACCESS
+CORS(app)
 
 # --- CONFIGURATION ---
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 
-# Check if keys loaded correctly
 if not TWILIO_AUTH_TOKEN:
     raise ValueError("No Twilio Auth Token found. Make sure .env file exists.")
 
-# Store call data in memory
-call_data_store = {}
-
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Store call data AND the synchronization events
+call_data_store = {}
 
 @app.route('/make-call', methods=['POST'])
 def make_call():
@@ -34,6 +31,7 @@ def make_call():
     server_url = request.host_url 
 
     try:
+        # 1. Start the call
         call = client.calls.create(
             to=user_number,
             from_=TWILIO_PHONE_NUMBER,
@@ -43,33 +41,46 @@ def make_call():
             status_callback_event=['completed']
         )
         
+        # 2. Create a "Pause Button" (Event) for this specific call
+        call_complete_event = threading.Event()
+        
         call_data_store[call.sid] = {
             'status': 'initiated', 
-            'recording_url': None,
-            'transcription': 'Processing...' 
+            'transcription': None,
+            'event': call_complete_event  # Store the event so we can trigger it later
         }
         
-        return jsonify({
-            'message': 'Call Initiated.', 
-            'call_sid': call.sid,
-            'check_status_url': f"{server_url}get-response/{call.sid}"
-        })
+        print(f"Waiting for user {user_number} to speak...")
+        
+        # 3. PAUSE HERE! Wait up to 60 seconds for the user to speak
+        # The code stops on this line until 'event.set()' is called in handle_recording
+        is_completed = call_complete_event.wait(timeout=60)
+        
+        # 4. If we get here, either the user spoke OR 60 seconds passed
+        if is_completed:
+            final_text = call_data_store[call.sid]['transcription']
+            return jsonify({
+                'status': 'success',
+                'call_sid': call.sid,
+                'user_response': final_text
+            })
+        else:
+            return jsonify({
+                'status': 'timeout', 
+                'message': 'User did not respond within 60 seconds.'
+            }), 408
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/voice-logic', methods=['GET', 'POST'])
 def voice_logic():
-    """Instructions for the call"""
     server_url = request.host_url
     resp = VoiceResponse()
     
-    # 1. Speak instructions
-    resp.say("Hello. Please say your full name clearly after the beep.", voice='alice', language='en-IN')
+    resp.say("Hello. Please say your full name clearly.", voice='alice', language='en-IN')
     
-    # 2. Play Beep
-    resp.play('https://api.twilio.com/cowbell.mp3') 
-
-    # 3. Gather Speech
+    # Listen for speech
     gather = resp.gather(
         input='speech', 
         language='en-IN', 
@@ -83,19 +94,24 @@ def voice_logic():
 
 @app.route('/handle-recording', methods=['GET', 'POST'])
 def handle_recording():
-    """Called immediately after they stop speaking"""
+    """Called by Twilio when the user stops speaking"""
     call_sid = request.values.get('CallSid')
     speech_text = request.values.get('SpeechResult') 
-    confidence = request.values.get('Confidence') 
-
-    print(f"DEBUG: Speech received: {speech_text} (Confidence: {confidence})")
+    
+    print(f"DEBUG: Speech received for {call_sid}: {speech_text}")
     
     if call_sid in call_data_store:
+        # 1. Save the text
         if speech_text:
             call_data_store[call_sid]['transcription'] = speech_text
             call_data_store[call_sid]['status'] = 'completed'
         else:
             call_data_store[call_sid]['transcription'] = "(No speech detected)"
+            
+        # 2. PRESS THE PLAY BUTTON!
+        # This tells the waiting 'make_call' function to wake up and finish
+        if 'event' in call_data_store[call_sid]:
+            call_data_store[call_sid]['event'].set()
         
     resp = VoiceResponse()
     if speech_text:
@@ -105,28 +121,33 @@ def handle_recording():
         
     return str(resp)
 
-@app.route('/handle-transcription', methods=['GET', 'POST'])
-def handle_transcription():
-    call_sid = request.values.get('CallSid')
-    transcription_text = request.values.get('TranscriptionText')
-    
-    if call_sid in call_data_store:
-        call_data_store[call_sid]['transcription'] = transcription_text
-        call_data_store[call_sid]['status'] = 'completed'
-        print(f"Transcription Received for {call_sid}: {transcription_text}")
-        
-    return "OK", 200
-
 @app.route('/call-status', methods=['GET', 'POST'])
 def call_status():
+    """Handle call completion events (hangups)"""
+    call_sid = request.values.get('CallSid')
+    call_status = request.values.get('CallStatus')
+    
+    # If user hangs up without speaking, we still need to unblock the API
+    if call_status in ['completed', 'failed', 'busy', 'no-answer']:
+        if call_sid in call_data_store and 'event' in call_data_store[call_sid]:
+             # If we haven't set a transcription yet, set it to "Call Ended"
+             if not call_data_store[call_sid]['transcription']:
+                 call_data_store[call_sid]['transcription'] = "User hung up or did not answer."
+             call_data_store[call_sid]['event'].set()
+
     return "OK", 200
 
+# We don't strictly need get-response anymore, but keeping it is fine
 @app.route('/get-response/<call_sid>', methods=['GET'])
 def get_response(call_sid):
     result = call_data_store.get(call_sid)
+    # Remove the event object before returning JSON (events aren't JSON serializable)
     if result:
-        return jsonify(result)
+        response_data = result.copy()
+        response_data.pop('event', None) 
+        return jsonify(response_data)
     return jsonify({'error': 'Call SID not found'}), 404
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # threaded=True is required so the "wait" doesn't block the "handle_recording" request!
+    app.run(debug=True, port=5000, threaded=True)
