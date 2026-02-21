@@ -148,6 +148,15 @@ def get_response(call_sid):
         return jsonify(response_data)
     return jsonify({'error': 'Call SID not found'}), 404
 
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "active",
+        "service": "calling-agent",
+        "message": "I am awake!"
+    }), 200
+
 if __name__ == '__main__':
     # threaded=True is required so the "wait" doesn't block the "handle_recording" request!
     app.run(debug=True, port=5000, threaded=True)
