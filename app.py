@@ -1,5 +1,7 @@
 import os
-import threading  # <--- NEW IMPORT
+import threading
+import urllib.parse
+import requests  # <--- NEW: To call your messaging API
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from twilio.rest import Client
@@ -15,148 +17,132 @@ CORS(app)
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
-
-if not TWILIO_AUTH_TOKEN:
-    raise ValueError("No Twilio Auth Token found. Make sure .env file exists.")
+MESSAGING_API_URL = "https://eymessaging.onrender.com/sensor-anomaly"
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# Store call data AND the synchronization events
 call_data_store = {}
 
 @app.route('/make-call', methods=['POST'])
 def make_call():
     data = request.json
     user_number = data.get('number')
+    issue = data.get('issue', 'Technical problem')
+    # CRITICAL: We need vehicle_id to pass to your messaging API later
+    vehicle_id = data.get('vehicle_id', 'TOYOTA_202403A#001') 
     server_url = request.host_url 
 
+    encoded_issue = urllib.parse.quote(issue)
+
     try:
-        # 1. Start the call
         call = client.calls.create(
             to=user_number,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{server_url}voice-logic",
+            url=f"{server_url}voice-logic?issue={encoded_issue}",
             method='POST',
             status_callback=f"{server_url}call-status",
             status_callback_event=['completed']
         )
         
-        # 2. Create a "Pause Button" (Event) for this specific call
         call_complete_event = threading.Event()
-        
         call_data_store[call.sid] = {
             'status': 'initiated', 
             'transcription': None,
-            'event': call_complete_event  # Store the event so we can trigger it later
+            'event': call_complete_event,
+            'vehicle_id': vehicle_id, # Store for later use
+            'issue': issue
         }
         
-        print(f"Waiting for user {user_number} to speak...")
-        
-        # 3. PAUSE HERE! Wait up to 60 seconds for the user to speak
-        # The code stops on this line until 'event.set()' is called in handle_recording
         is_completed = call_complete_event.wait(timeout=60)
         
-        # 4. If we get here, either the user spoke OR 60 seconds passed
         if is_completed:
             final_text = call_data_store[call.sid]['transcription']
             return jsonify({
                 'status': 'success',
-                'call_sid': call.sid,
-                'user_response': final_text
+                'user_choice': final_text
             })
         else:
-            return jsonify({
-                'status': 'timeout', 
-                'message': 'User did not respond within 60 seconds.'
-            }), 408
+            return jsonify({'status': 'timeout'}), 408
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/voice-logic', methods=['GET', 'POST'])
 def voice_logic():
+    issue = request.values.get('issue', 'a vehicle issue')
     server_url = request.host_url
     resp = VoiceResponse()
     
-    resp.say("Hello. Please say your full name clearly.", voice='alice', language='en-IN')
+    message = (
+        f"Hello Sir. We have detected the issue of {issue} in your vehicle. "
+        "To manually choose a service center on WhatsApp, say Book. "
+        "To automatically book at the nearest center, say Auto."
+    )
     
-    # Listen for speech
-    gather = resp.gather(
+    resp.say(message, voice='alice', language='en-IN')
+    
+    resp.gather(
         input='speech', 
         language='en-IN', 
+        hints='Book, Auto',
         speech_timeout='auto',
         action=f"{server_url}handle-recording",
         method='POST'
     )
-    
-    resp.say("We did not hear anything. Goodbye.", voice='alice', language='en-IN')
     return str(resp)
 
 @app.route('/handle-recording', methods=['GET', 'POST'])
 def handle_recording():
-    """Called by Twilio when the user stops speaking"""
     call_sid = request.values.get('CallSid')
-    speech_text = request.values.get('SpeechResult') 
+    speech_result = request.values.get('SpeechResult', '').lower() 
     
-    print(f"DEBUG: Speech received for {call_sid}: {speech_text}")
+    print(f"DEBUG: User choice: {speech_result}")
+    resp = VoiceResponse()
     
     if call_sid in call_data_store:
-        # 1. Save the text
-        if speech_text:
-            call_data_store[call_sid]['transcription'] = speech_text
-            call_data_store[call_sid]['status'] = 'completed'
+        call_data_store[call_sid]['transcription'] = speech_result
+        vehicle_id = call_data_store[call_sid]['vehicle_id']
+        issue = call_data_store[call_sid]['issue']
+        
+        # --- TRIGGER EXTERNAL MESSAGING API ---
+        if "book" in speech_result:
+            try:
+                # Trigger the WhatsApp Menu once
+                response = requests.post(MESSAGING_API_URL, json={
+                    "vehicle_id": vehicle_id,
+                    "issue_detected": issue
+                }, timeout=10) # Added timeout for safety
+                
+                print(f"📡 Messaging API Status: {response.status_code}")
+                print(f"📡 Messaging API Response: {response.text}")
+                
+                resp.say("Please check your WhatsApp to select a service center. Goodbye.", voice='alice', language='en-IN')
+            except Exception as e:
+                print(f"❌ API Call Failed: {e}")
+                resp.say("We encountered an error triggering WhatsApp, but our team will contact you. Goodbye.", voice='alice', language='en-IN')
+        
+        elif "auto" in speech_result:
+            print("🤖 Auto Booking Logic Triggered")
+            resp.say("Thank you. We are automatically booking your service. Goodbye.", voice='alice', language='en-IN')
+        
         else:
-            call_data_store[call_sid]['transcription'] = "(No speech detected)"
-            
-        # 2. PRESS THE PLAY BUTTON!
-        # This tells the waiting 'make_call' function to wake up and finish
+            resp.say("Thank you. Your response has been recorded. Goodbye.", voice='alice', language='en-IN')
+
+        # Wake up the Postman request
         if 'event' in call_data_store[call_sid]:
             call_data_store[call_sid]['event'].set()
-        
-    resp = VoiceResponse()
-    if speech_text:
-        resp.say(f"Thank you, {speech_text}. We have recorded your response.", voice='alice', language='en-IN')
-    else:
-        resp.say("Thank you. Goodbye.", voice='alice', language='en-IN')
         
     return str(resp)
 
 @app.route('/call-status', methods=['GET', 'POST'])
 def call_status():
-    """Handle call completion events (hangups)"""
     call_sid = request.values.get('CallSid')
     call_status = request.values.get('CallStatus')
-    
-    # If user hangs up without speaking, we still need to unblock the API
     if call_status in ['completed', 'failed', 'busy', 'no-answer']:
         if call_sid in call_data_store and 'event' in call_data_store[call_sid]:
-             # If we haven't set a transcription yet, set it to "Call Ended"
              if not call_data_store[call_sid]['transcription']:
-                 call_data_store[call_sid]['transcription'] = "User hung up or did not answer."
+                 call_data_store[call_sid]['transcription'] = "No Response"
              call_data_store[call_sid]['event'].set()
-
     return "OK", 200
 
-# We don't strictly need get-response anymore, but keeping it is fine
-@app.route('/get-response/<call_sid>', methods=['GET'])
-def get_response(call_sid):
-    result = call_data_store.get(call_sid)
-    # Remove the event object before returning JSON (events aren't JSON serializable)
-    if result:
-        response_data = result.copy()
-        response_data.pop('event', None) 
-        return jsonify(response_data)
-    return jsonify({'error': 'Call SID not found'}), 404
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "active",
-        "service": "calling-agent",
-        "message": "I am awake!"
-    }), 200
-
 if __name__ == '__main__':
-    # threaded=True is required so the "wait" doesn't block the "handle_recording" request!
     app.run(debug=True, port=5000, threaded=True)
