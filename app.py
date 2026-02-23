@@ -22,6 +22,11 @@ MESSAGING_API_URL = "https://eymessaging.onrender.com/sensor-anomaly"
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 call_data_store = {}
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint to verify the API is running."""
+    return jsonify({'status': 'healthy', 'message': 'Service is up and running'}), 200
+
 @app.route('/make-call', methods=['POST'])
 def make_call():
     data = request.json
