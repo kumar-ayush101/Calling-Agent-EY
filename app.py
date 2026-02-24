@@ -114,7 +114,8 @@ def handle_recording():
                 # Trigger the WhatsApp Menu once
                 response = requests.post(MESSAGING_API_URL, json={
                     "vehicle_id": vehicle_id,
-                    "issue_detected": issue
+                    "issue_detected": issue,
+                    "mode": "manual"
                 }, timeout=10) # Added timeout for safety
                 
                 print(f"📡 Messaging API Status: {response.status_code}")
@@ -127,7 +128,21 @@ def handle_recording():
         
         elif "auto" in speech_result:
             print("🤖 Auto Booking Logic Triggered")
-            resp.say("Thank you. We are automatically booking your service. Goodbye.", voice='alice', language='en-IN')
+            try:
+                # NEW LOGIC: Trigger the WhatsApp Confirmation for Auto
+                response = requests.post(MESSAGING_API_URL, json={
+                    "vehicle_id": vehicle_id,
+                    "issue_detected": issue,
+                    "mode": "auto" # Tells your API this is an auto-booking
+                }, timeout=10) 
+                
+                print(f"📡 Messaging API Status (Auto): {response.status_code}")
+                print(f"📡 Messaging API Response (Auto): {response.text}")
+                
+                resp.say("Thank you. We are automatically booking your service and have sent a confirmation on WhatsApp. Goodbye.", voice='alice', language='en-IN')
+            except Exception as e:
+                print(f"❌ API Call Failed: {e}")
+                resp.say("Thank you. We are automatically booking your service, but encountered an error sending the WhatsApp confirmation. Goodbye.", voice='alice', language='en-IN')
         
         else:
             resp.say("Thank you. Your response has been recorded. Goodbye.", voice='alice', language='en-IN')
