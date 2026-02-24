@@ -85,14 +85,25 @@ def voice_logic():
     
     resp.say(message, voice='alice', language='en-IN')
     
+    # --- RELIABILITY FIXES APPLIED HERE ---
     resp.gather(
         input='speech', 
         language='en-IN', 
         hints='Book, Auto',
-        speech_timeout='auto',
+        timeout=10,              # <--- FIX 1: Wait 10 full seconds for the user to start speaking
+        speech_timeout='auto',   # Stops listening once they finish their sentence
         action=f"{server_url}handle-recording",
         method='POST'
     )
+    
+    # <--- FIX 2: If the 10 seconds pass and they say nothing, Twilio reads this line.
+    # Before, there was nothing here, which caused the abrupt silent hangup!
+    resp.say(
+        "We did not hear a response. Our team will reach out to you shortly. Goodbye.", 
+        voice='alice', 
+        language='en-IN'
+    )
+    
     return str(resp)
 
 @app.route('/handle-recording', methods=['GET', 'POST'])
